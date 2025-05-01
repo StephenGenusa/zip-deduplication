@@ -1,7 +1,10 @@
 # ZIP File Deduplication Program 🧹
 
 > ⚠️ **Always test with `--dry-run` first!** Deduplication is irreversible without backups. There is a backup option you can use as a temporary directory/subdirectories to await manual deletion.
-> 
+
+> The method extract_date_from_filename uses the patterns I use for downloads which is repo_name_YYYY-MM-DD HH:MM:SS.zip. You may need to change this for your own use.
+
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 **Advanced ZIP File Deduplication Tool** that identifies and removes duplicate ZIP files based on content, not just filenames or sizes. Perfect for cleaning up backup directories, versioned archives, and automated ZIP exports.
