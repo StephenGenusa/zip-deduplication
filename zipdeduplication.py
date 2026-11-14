@@ -14,15 +14,21 @@ import multiprocessing
 import os
 import re
 import shutil
-import signal
 import sys
 import time
+import zipfile
 from collections import defaultdict
 from datetime import datetime
-from pathlib import Path
-from typing import Any, DefaultDict, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, DefaultDict, Dict, List, Optional, Sequence, Set, Tuple
 
-import zipfile
+# (file path, size in bytes, date)
+FileInfo = Tuple[str, int, datetime]
+
+# Identifies a file's content; equal signatures mean identical content.
+Signature = Tuple[str, Any]
+
+DEFAULT_REPORT_NAME = "zip_content_matches.tsv"
+HASH_CHUNK = 1024 * 1024
 
 
 class ZipDeduplicator:
@@ -33,20 +39,30 @@ class ZipDeduplicator:
 
     Attributes:
         args: Command line arguments
-        stats: Statistics about deletion operations
+        stats: Statistics about removal operations
+        errors: Number of groups or files that could not be processed
     """
 
     def __init__(self) -> None:
         """Initialize the ZipDeduplicator with default statistics."""
-        self.args: argparse.Namespace = None
+        self.args: Optional[argparse.Namespace] = None
         self.stats: Dict[str, Any] = {
             "total_deleted": 0,
             "total_bytes_saved": 0,
             "directories_processed": defaultdict(lambda: {"files": 0, "bytes": 0}),
         }
+        self.errors = 0
+        self.zip_files_seen = 0
+        # Content signature of every file examined, by path.
+        self._signatures: Dict[str, Optional[Signature]] = {}
+        # Files removed (or, in a dry run, that would be removed) by this run.
+        self._removed: Set[str] = set()
 
-    def parse_arguments(self) -> argparse.Namespace:
+    def parse_arguments(self, argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
         """Parse command line arguments with comprehensive options and detailed help.
+
+        Args:
+            argv: Arguments to parse; defaults to the process arguments
 
         Returns:
             argparse.Namespace: Parsed command line arguments
@@ -86,9 +102,9 @@ class ZipDeduplicator:
             "--strategy", "-s",
             choices=["exact", "smart"],
             default="exact",
-            help="Deduplication strategy to use: 'exact' only removes completely identical files, "
-                 "'smart' applies retention policies to keep representative versions while "
-                 "removing intermediate minor changes."
+            help="Deduplication strategy to use: 'exact' only removes completely identical files. "
+                 "'smart' also limits each file group to --max-versions different versions, "
+                 "deleting the least significant ones when a group has more than that."
         )
 
         # Smart retention options
@@ -97,31 +113,24 @@ class ZipDeduplicator:
             "--growth-threshold", "-g",
             type=float,
             default=5.0,
-            help="Size growth percentage threshold. When a file grows by less than this percentage "
-                 "compared to a previous version, it's considered a minor change. Higher values will "
-                 "result in more files being considered duplicates. Specified as a percentage (e.g., 5.0 = 5%%)."
-        )
-        retention_group.add_argument(
-            "--keep-interval", "-k",
-            type=int,
-            default=7,
-            help="Minimum interval in days between retained versions when using smart retention. "
-                 "Files with timestamps closer than this interval may be considered duplicates "
-                 "if other criteria are met."
+            help="Size growth percentage that makes a version worth keeping. When a group must be cut "
+                 "down, versions that grew by more than this percentage are kept ahead of the others, "
+                 "largest growth first. Shrinking does not count. Specified as a percentage (e.g., 5.0 = 5%%)."
         )
         retention_group.add_argument(
             "--max-versions", "-m",
             type=int,
             default=5,
-            help="Maximum number of versions to keep for any file group when using smart retention. "
-                 "This ensures that even with many small changes, you'll never keep more than "
-                 "this many versions. Always keeps at least the oldest and newest version."
+            help="Maximum number of different versions to keep for any file group when using smart "
+                 "retention (at least 2). Groups with this many versions or fewer are left alone. Larger "
+                 "groups are cut to exactly this many: the oldest, the newest, the versions that grew the "
+                 "most, then versions spread evenly by date."
         )
 
         # Safety options
         safety_group = parser.add_argument_group("Safety Options")
         safety_group.add_argument(
-            "--dry-run", "-n",
+            "--dry-run", "-n", "-d",
             action="store_true",
             help="Simulation mode: identify duplicates but don't actually delete or move any files. "
                  "Use this to preview what would happen before making changes."
@@ -129,17 +138,26 @@ class ZipDeduplicator:
         safety_group.add_argument(
             "--backup-dir", "-b",
             help="Instead of deleting duplicate files, move them to this directory. "
-                 "The original directory structure will be preserved within the backup directory."
+                 "The original directory structure will be preserved within the backup directory. "
+                 "The backup directory itself is never scanned, and files already in it are never overwritten."
         )
 
         # Output control
         output_group = parser.add_argument_group("Output Options")
         output_group.add_argument(
+            "--report",
+            nargs="?",
+            const=DEFAULT_REPORT_NAME,
+            metavar="PATH",
+            help="Also write a report of ZIP files with identical content that this run does not remove, "
+                 "because they have different names or are in different directories. Nothing listed in it "
+                 f"is deleted. The file is overwritten on every run. (path when none is given: {DEFAULT_REPORT_NAME})"
+        )
+        output_group.add_argument(
             "--verbose", "-v",
             action="count",
             default=0,
-            help="Increase output verbosity. Use -v for detailed output or -vv for debug level information. "
-                 "Shows additional processing details and decision-making criteria."
+            help="Show debug output: processing details and decision-making criteria."
         )
         output_group.add_argument(
             "--quiet", "-q",
@@ -147,7 +165,16 @@ class ZipDeduplicator:
             help="Suppress non-essential output. Only warnings, errors and final statistics will be displayed."
         )
 
-        return parser.parse_args()
+        args = parser.parse_args(argv)
+
+        if args.threads < 1:
+            parser.error("--threads must be at least 1")
+        if args.max_versions < 2:
+            parser.error("--max-versions must be at least 2 (the oldest and newest are always kept)")
+        if not os.path.isdir(args.directory):
+            parser.error(f"not a directory: {args.directory}")
+
+        return args
 
     def setup_logging(self) -> None:
         """Configure logging based on verbosity level."""
@@ -158,18 +185,7 @@ class ZipDeduplicator:
         else:
             level = logging.DEBUG
 
-        logging.basicConfig(format="%(levelname)s: %(message)s", level=level)
-
-    def signal_handler(self, sig: int, frame: Any) -> None:
-        """Handle interrupt signals to show statistics before exit.
-
-        Args:
-            sig: Signal number
-            frame: Current stack frame
-        """
-        logging.warning("\nProcess interrupted by user. Finalizing...")
-        self.print_statistics()
-        sys.exit(0)
+        logging.basicConfig(format="%(levelname)s: %(message)s", level=level, force=True)
 
     @staticmethod
     def format_size(size_bytes: int) -> str:
@@ -191,59 +207,54 @@ class ZipDeduplicator:
             return f"{size_bytes/(1024*1024*1024):.2f} GB"
 
     @staticmethod
-    def extract_date_from_filename(filename: str) -> Union[datetime, str]:
+    def extract_date_from_filename(filename: str) -> datetime:
         """Extract date from filename using various patterns.
 
         Args:
             filename: Path to the file
 
         Returns:
-            Union[datetime, str]: Extracted date or date string
+            datetime: Date from the filename, or the file's modification time
+                when the name holds no recognizable date
         """
         # Remove extension
         basename = os.path.splitext(os.path.basename(filename))[0]
 
-        # Common date formats in filenames
+        # Common date formats in filenames. Date-and-time patterns must come
+        # before the date-only pattern, which would otherwise match first and
+        # discard the time of day.
         patterns = [
-            # ISO format: 2023-01-30 or 2023_01_30
-            r"(\d{4}[-_]\d{2}[-_]\d{2})",
             # ISO with time: 2023-01-30_14-30-45 or 2023_01_30_14_30_45
             r"(\d{4}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2}[-_]\d{2})",
             # Date with spaces: 2023-01-30 14-30-45
             r"(\d{4}[-_]\d{2}[-_]\d{2}\s\d{2}[-_]\d{2}[-_]\d{2})",
+            # ISO format: 2023-01-30 or 2023_01_30
+            r"(\d{4}[-_]\d{2}[-_]\d{2})",
             # American format: 01-30-2023
             r"(\d{2}[-_]\d{2}[-_]\d{4})",
-            # Simple number sequence (fallback)
-            r"(\d+)$",
+        ]
+        formats = [
+            "%Y-%m-%d",
+            "%Y_%m_%d",
+            "%Y-%m-%d_%H-%M-%S",
+            "%Y_%m_%d_%H_%M_%S",
+            "%Y-%m-%d %H-%M-%S",
+            "%Y-%m-%d %H:%M:%S",
+            "%m-%d-%Y",
+            "%m_%d_%Y",
         ]
 
         for pattern in patterns:
             match = re.search(pattern, basename)
             if match:
-                date_str = match.group(1)
-                try:
-                    # Try parsing with different formats
-                    for fmt in [
-                        "%Y-%m-%d",
-                        "%Y_%m_%d",
-                        "%Y-%m-%d_%H-%M-%S",
-                        "%Y_%m_%d_%H_%M_%S",
-                        "%Y-%m-%d %H-%M-%S",
-                        "%Y-%m-%d %H:%M:%S",
-                        "%m-%d-%Y",
-                        "%m_%d_%Y",
-                    ]:
-                        try:
-                            return datetime.strptime(date_str, fmt)
-                        except ValueError:
-                            continue
+                for fmt in formats:
+                    try:
+                        return datetime.strptime(match.group(1), fmt)
+                    except ValueError:
+                        continue
 
-                    # Fallback: just use the string for comparison
-                    return date_str
-                except Exception:
-                    return date_str
-
-        # If no date found, use file modification time
+        # No usable date in the name (a trailing version number such as
+        # "tool-1.0.0" is not a date): use the file modification time.
         return datetime.fromtimestamp(os.path.getmtime(filename))
 
     @staticmethod
@@ -272,100 +283,48 @@ class ZipDeduplicator:
         return base
 
     @staticmethod
-    def compare_zips_by_crc(file1: str, file2: str) -> bool:
-        """Compare two ZIP files by checking CRC values of internal files.
+    def zip_signature(path: str) -> Optional[Signature]:
+        """Describe a file's content so equal content gives an equal signature.
+
+        For a readable ZIP the signature is the name, CRC and uncompressed size
+        of every entry (including entries that share a name), so two archives
+        holding the same files match even when their bytes differ through
+        compression or timestamps. A file that cannot be read as a ZIP is
+        identified by the SHA-256 of its bytes, so only exact copies match.
 
         Args:
-            file1: Path to first ZIP file
-            file2: Path to second ZIP file
+            path: Path to the file
 
         Returns:
-            bool: True if all CRCs match, False otherwise
+            Optional[Signature]: The signature, or None if the file cannot be read
         """
         try:
-            with zipfile.ZipFile(file1) as zip1, zipfile.ZipFile(file2) as zip2:
-                # Get file listings
-                files1 = sorted(zip1.infolist(), key=lambda x: x.file_size)
-                files2 = sorted(zip2.infolist(), key=lambda x: x.file_size)
-
-                # Quick check for different file counts
-                if len(files1) != len(files2):
-                    return False
-
-                # Create dictionaries of filename to CRC
-                crc_dict1 = {info.filename: info.CRC for info in files1}
-                crc_dict2 = {info.filename: info.CRC for info in files2}
-
-                # Check if file lists match
-                if set(crc_dict1.keys()) != set(crc_dict2.keys()):
-                    return False
-
-                # Compare CRCs of each file
-                for filename, crc1 in crc_dict1.items():
-                    if crc1 != crc_dict2[filename]:
-                        return False
-
-                # All CRCs match
-                return True
+            with zipfile.ZipFile(path) as archive:
+                entries = sorted(
+                    (info.filename, info.CRC, info.file_size) for info in archive.infolist()
+                )
+            return ("zip", tuple(entries))
         except Exception as e:
-            logging.error(f"Error comparing ZIP files: {e}")
-            return False
+            logging.debug(f"Not readable as a ZIP ({e}); comparing by whole-file hash: {path}")
 
-    @staticmethod
-    def fallback_compare_zips_by_hash(file1: str, file2: str) -> bool:
-        """Fallback hash-based comparison if CRC check is inconclusive.
-
-        Args:
-            file1: Path to first ZIP file
-            file2: Path to second ZIP file
-
-        Returns:
-            bool: True if all file contents match, False otherwise
-        """
         try:
-            with zipfile.ZipFile(file1) as zip1, zipfile.ZipFile(file2) as zip2:
-                # Get file listings sorted by size (smallest first)
-                files1 = sorted(zip1.infolist(), key=lambda x: x.file_size)
-                files2 = sorted(zip2.infolist(), key=lambda x: x.file_size)
+            digest = hashlib.sha256()
+            with open(path, "rb") as handle:
+                for chunk in iter(lambda: handle.read(HASH_CHUNK), b""):
+                    digest.update(chunk)
+            return ("raw", digest.hexdigest())
+        except OSError as e:
+            logging.error(f"Cannot read {path}: {e}")
+            return None
 
-                # Check file count
-                if len(files1) != len(files2):
-                    return False
-
-                # Create file name maps
-                file_map1 = {info.filename: info for info in files1}
-                file_map2 = {info.filename: info for info in files2}
-
-                # Check if file lists match
-                if set(file_map1.keys()) != set(file_map2.keys()):
-                    return False
-
-                # Compare content of each file, starting with smallest
-                for filename in sorted(
-                    file_map1.keys(), key=lambda x: file_map1[x].file_size
-                ):
-                    data1 = zip1.read(filename)
-                    data2 = zip2.read(filename)
-
-                    # Quick size check
-                    if len(data1) != len(data2):
-                        return False
-
-                    # Compare sha256 hashes
-                    hash1 = hashlib.sha256(data1).digest()
-                    hash2 = hashlib.sha256(data2).digest()
-
-                    if hash1 != hash2:
-                        return False
-
-                # All files identical
-                return True
-        except Exception as e:
-            logging.error(f"Error in fallback comparison: {e}")
-            return False
+    def signature_for(self, path: str) -> Optional[Signature]:
+        """Return the content signature of a file, computing it at most once."""
+        if path not in self._signatures:
+            self._signatures[path] = self.zip_signature(path)
+        return self._signatures[path]
 
     def are_zips_identical(self, file1: str, file2: str) -> bool:
-        """Determine if two ZIP files are identical using progressive checks.
+        """Determine if two ZIP files hold identical content.
 
         Args:
             file1: Path to first ZIP file
@@ -374,124 +333,92 @@ class ZipDeduplicator:
         Returns:
             bool: True if files are identical, False otherwise
         """
-        # Quick size check first
-        if os.path.getsize(file1) != os.path.getsize(file2):
-            return False
+        signature = self.signature_for(file1)
+        return signature is not None and signature == self.signature_for(file2)
 
-        logging.debug(f"Comparing ZIP files: {file1} and {file2}")
+    def apply_smart_retention(self, file_group: List[FileInfo]) -> List[FileInfo]:
+        """Choose which distinct versions of a group to delete.
 
-        # Method 1: CRC comparison (fastest)
-        try:
-            result = self.compare_zips_by_crc(file1, file2)
-            if result:
-                logging.debug("Files match by CRC check")
-                return True
-            logging.debug("CRC check failed, trying content hash")
-        except Exception as e:
-            logging.debug(f"CRC comparison error: {e}, trying content hash")
+        A group within ``--max-versions`` is left alone. A larger group is cut
+        to exactly that many versions, kept in this order of priority:
 
-        # Method 2: Content hash comparison
-        try:
-            result = self.fallback_compare_zips_by_hash(file1, file2)
-            if result:
-                logging.debug("Files match by content hash")
-                return True
-            logging.debug("Content hash check failed")
-        except Exception as e:
-            logging.debug(f"Content hash comparison error: {e}, trying whole-file hash")
-
-        # Method 3: Last resort - whole file hash comparison
-        try:
-            with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
-                # Compare file hashes in chunks to avoid memory issues
-                h1 = hashlib.sha256()
-                h2 = hashlib.sha256()
-
-                while True:
-                    chunk1 = f1.read(8192)
-                    chunk2 = f2.read(8192)
-
-                    if not chunk1 and not chunk2:  # Both files ended
-                        result = h1.digest() == h2.digest()
-                        if result:
-                            logging.debug("Files match by whole-file hash")
-                        return result
-
-                    if not chunk1 or not chunk2 or len(chunk1) != len(chunk2):
-                        return False  # Files have different lengths
-
-                    h1.update(chunk1)
-                    h2.update(chunk2)
-        except Exception as e:
-            logging.error(f"Whole-file hash comparison error: {e}")
-            return False
-
-    def apply_smart_retention(
-        self, file_group: List[Tuple[str, int, Union[datetime, str]]]
-    ) -> List[Tuple[str, int, Union[datetime, str]]]:
-        """Apply smart retention policy to a group of files.
+        1. The oldest and the newest.
+        2. Versions that grew by more than ``--growth-threshold`` percent,
+           largest growth first. Growth is measured from the smallest size
+           seen since the last such version, so growth after a lasting shrink
+           still counts. A version that shrank gets no priority.
+        3. Versions nearest the middle of the widest remaining date gaps.
 
         Args:
-            file_group: List of tuples (file_path, size, date)
+            file_group: List of tuples (file_path, size, date), all with
+                different content
 
         Returns:
-            List[Tuple[str, int, Union[datetime, str]]]: Files to delete
+            List[FileInfo]: Files to delete
         """
-        # Sort files by date
-        file_group.sort(key=lambda x: x[2])
+        limit = self.args.max_versions
+        if len(file_group) <= limit:
+            return []
 
-        # Always keep the oldest file
-        to_keep = [file_group[0]]
+        # Sort files by date; the path breaks ties
+        file_group.sort(key=lambda x: (x[2], x[0]))
+        last = len(file_group) - 1
 
-        # Analyze size changes
-        for i in range(1, len(file_group)):
-            prev_file, prev_size, prev_date = to_keep[-1]
-            curr_file, curr_size, curr_date = file_group[i]
+        # Always keep the oldest and the newest
+        keep: Set[int] = {0, last}
 
-            # Always keep the file if it's smaller than previous
-            if curr_size < prev_size:
-                to_keep.append(file_group[i])
-                continue
+        # Find versions that grew significantly
+        growths: List[Tuple[float, int]] = []
+        baseline = file_group[0][1]
+        for i in range(1, last):
+            size = file_group[i][1]
+            if baseline > 0:
+                growth_pct = (size - baseline) / baseline * 100
+            else:
+                # Any growth from an empty file counts as significant
+                growth_pct = float("inf") if size > 0 else 0.0
 
-            # Calculate size increase percentage
-            size_increase_pct = ((curr_size - prev_size) / prev_size) * 100
+            if growth_pct > self.args.growth_threshold:
+                growths.append((growth_pct, i))
+                baseline = size
+            elif size < baseline:
+                baseline = size
 
-            # If significant size increase, keep it
-            if size_increase_pct > self.args.growth_threshold:
-                to_keep.append(file_group[i])
-                continue
+        # Keep the largest growths that fit (the newer of two equal ones first)
+        growths.sort(key=lambda g: (-g[0], -g[1]))
+        keep.update(i for _, i in growths[:limit - 2])
 
-            # Check time interval
-            if isinstance(prev_date, datetime) and isinstance(curr_date, datetime):
-                days_diff = (curr_date - prev_date).days
-                if days_diff >= self.args.keep_interval:
-                    to_keep.append(file_group[i])
-                    continue
+        # Fill what room is left from the middle of the widest date gaps
+        while len(keep) < limit:
+            kept = sorted(keep)
+            widest = None
+            for start, end in zip(kept, kept[1:]):
+                if end - start < 2:
+                    continue  # nothing between these two
+                gap = file_group[end][2] - file_group[start][2]
+                if widest is None or gap > widest[0]:
+                    widest = (gap, start, end)
 
-        # Always keep the newest file if not already kept
-        if file_group[-1] not in to_keep:
-            to_keep.append(file_group[-1])
+            _, start, end = widest
+            middle = file_group[start][2] + (file_group[end][2] - file_group[start][2]) / 2
+            keep.add(min(
+                range(start + 1, end),
+                key=lambda i: abs(file_group[i][2] - middle),
+            ))
 
-        # If we have too many versions, keep first, last, and evenly spaced ones
-        if len(to_keep) > self.args.max_versions:
-            # Always keep first and last
-            must_keep = [to_keep[0], to_keep[-1]]
+        # Mark files not kept for deletion
+        return [f for i, f in enumerate(file_group) if i not in keep]
 
-            # Add evenly spaced samples from the middle
-            middle = to_keep[1:-1]
-            samples = self.args.max_versions - 2  # Subtract first and last
-
-            if samples > 0 and middle:
-                step = max(1, len(middle) // samples)
-                for i in range(0, len(middle), step):
-                    if len(must_keep) < self.args.max_versions:
-                        must_keep.append(middle[i])
-
-            to_keep = must_keep
-
-        # Mark files not in to_keep for deletion
-        files_to_delete = [f for f in file_group if f not in to_keep]
-        return files_to_delete
+    @staticmethod
+    def _unused_path(path: str) -> str:
+        """Return ``path``, or a numbered variant of it if something is already there."""
+        if not os.path.lexists(path):
+            return path
+        stem, ext = os.path.splitext(path)
+        number = 1
+        while os.path.lexists(f"{stem} ({number}){ext}"):
+            number += 1
+        return f"{stem} ({number}){ext}"
 
     def delete_or_backup_file(self, file_path: str) -> bool:
         """Delete file or move to backup directory based on options."""
@@ -501,22 +428,17 @@ class ZipDeduplicator:
 
             if self.args.dry_run:
                 logging.info(f"[DRY RUN] Would remove: {file_path}")
-                # Update stats as if deleted
-                self.stats["total_deleted"] += 1
-                self.stats["total_bytes_saved"] += file_size
-                self.stats["directories_processed"][dir_path]["files"] += 1
-                self.stats["directories_processed"][dir_path]["bytes"] += file_size
-                return True
-
-            if self.args.backup_dir:
+            elif self.args.backup_dir:
                 # Calculate path relative to the base scan directory
                 rel_path = os.path.relpath(dir_path, self.args.directory)
                 # Create matching structure in backup directory
                 backup_path = os.path.join(self.args.backup_dir, rel_path)
                 os.makedirs(backup_path, exist_ok=True)
 
-                # Move file to backup
-                dest_path = os.path.join(backup_path, os.path.basename(file_path))
+                # Move file to backup, never replacing an earlier backup
+                dest_path = self._unused_path(
+                    os.path.join(backup_path, os.path.basename(file_path))
+                )
                 shutil.move(file_path, dest_path)
                 logging.info(f"Moved to backup: {file_path} -> {dest_path}")
             else:
@@ -525,6 +447,7 @@ class ZipDeduplicator:
                 logging.info(f"Deleted: {file_path}")
 
             # Update statistics
+            self._removed.add(file_path)
             self.stats["total_deleted"] += 1
             self.stats["total_bytes_saved"] += file_size
             self.stats["directories_processed"][dir_path]["files"] += 1
@@ -532,82 +455,49 @@ class ZipDeduplicator:
             return True
         except Exception as e:
             logging.error(f"Error removing {file_path}: {e}")
+            self.errors += 1
             return False
 
-    def process_file_group(
-            self, file_group: List[str]
-    ) -> List[Tuple[str, int, Union[datetime, str]]]:
-        """Process a group of files with the same base name pattern."""
+    def process_file_group(self, file_group: List[str]) -> List[FileInfo]:
+        """Process a group of files with the same base name pattern.
+
+        Args:
+            file_group: Paths of the files in the group
+
+        Returns:
+            List[FileInfo]: Files to delete
+        """
         # Skip singleton groups
         if len(file_group) <= 1:
             return []
 
-        # Sort by file size (ascending) for more efficient comparison
-        file_group.sort(key=lambda x: os.path.getsize(x))
-
-        # Group files with same size
-        size_groups: DefaultDict[int, List[Tuple[str, int, Union[datetime, str]]]] = defaultdict(
-            list
+        # Oldest first; the path breaks ties so the result is deterministic
+        files: List[FileInfo] = sorted(
+            (
+                (path, os.path.getsize(path), self.extract_date_from_filename(path))
+                for path in file_group
+            ),
+            key=lambda info: (info[2], info[0]),
         )
-        for file_path in file_group:
-            size = os.path.getsize(file_path)
-            date = self.extract_date_from_filename(file_path)
-            size_groups[size].append((file_path, size, date))
 
-        duplicates = []
+        # Group files with identical content
+        by_signature: DefaultDict[Signature, List[FileInfo]] = defaultdict(list)
+        for info in files:
+            signature = self.signature_for(info[0])
+            if signature is not None:  # unreadable files are never duplicates
+                by_signature[signature].append(info)
 
-        # First pass: find exact duplicates by CRC
-        for size, files in size_groups.items():
-            if len(files) > 1:
-                # Group identical files
-                identical_groups = []
-                processed: Set[str] = set()
-
-                for i, (file1, _, date1) in enumerate(files):
-                    if file1 in processed:
-                        continue
-
-                    identical_files = [(file1, size, date1)]
-                    processed.add(file1)
-
-                    for j in range(i + 1, len(files)):
-                        file2, _, date2 = files[j]
-                        if file2 not in processed:
-                            # Verify if files are identical and call verification if they are
-                            are_identical = self.are_zips_identical(file1, file2)
-                            if are_identical:
-                                # self.verify_identical_files(file1, file2)
-                                identical_files.append((file2, size, date2))
-                                processed.add(file2)
-
-                    if len(identical_files) > 1:
-                        # Sort by date, keep oldest
-                        identical_files.sort(key=lambda x: x[2])
-                        identical_groups.append(identical_files)
-
-                # Mark duplicates for deletion, keeping oldest
-                for group in identical_groups:
-                    # Keep the oldest file (first in the sorted list)
-                    to_delete = group[1:]
-                    duplicates.extend(to_delete)
+        # Mark duplicates for deletion, keeping the oldest of each identical set
+        duplicates: List[FileInfo] = []
+        for identical in by_signature.values():
+            duplicates.extend(identical[1:])
 
         # Smart retention if enabled
-        if (
-                self.args.strategy == "smart"
-                and len(file_group) > self.args.max_versions
-        ):
-            # Get all unique files (excluding duplicates)
-            unique_files = []
+        if self.args.strategy == "smart":
+            # Apply smart retention to unique files (excluding duplicates)
             duplicate_paths = {d[0] for d in duplicates}
-
-            for size, files in size_groups.items():
-                for file_info in files:
-                    if file_info[0] not in duplicate_paths:
-                        unique_files.append(file_info)
-
-            # Apply smart retention to unique files
-            smart_deletions = self.apply_smart_retention(unique_files)
-            duplicates.extend(smart_deletions)
+            unique_files = [info for info in files if info[0] not in duplicate_paths]
+            duplicates.extend(self.apply_smart_retention(unique_files))
 
         return duplicates
 
@@ -619,10 +509,17 @@ class ZipDeduplicator:
         """
         logging.info(f"Scanning directory: {directory}")
 
+        backup_dir = os.path.abspath(self.args.backup_dir) if self.args.backup_dir else None
+
         # Process files directory by directory
         if self.args.recursive:
             # For recursive mode, process each directory separately
-            for root, _, files in os.walk(directory):
+            for root, dirs, files in os.walk(directory):
+                # Never scan the backup directory: files moved there would be
+                # treated as new duplicates on this or a later run
+                dirs[:] = [
+                    d for d in dirs if os.path.abspath(os.path.join(root, d)) != backup_dir
+                ]
                 zip_files = [os.path.join(root, f) for f in files if f.lower().endswith(".zip")]
                 if zip_files:
                     logging.info(f"Processing subdirectory: {root}")
@@ -636,8 +533,9 @@ class ZipDeduplicator:
             ]
             if zip_files:
                 self._process_directory_files(zip_files, directory)
-            else:
-                logging.warning(f"No ZIP files found in {directory}")
+
+        if self.zip_files_seen == 0:
+            logging.warning(f"No ZIP files found in {directory}")
 
     def _process_directory_files(self, zip_files: List[str], directory_path: str) -> None:
         """Process a list of ZIP files within a single directory.
@@ -649,6 +547,7 @@ class ZipDeduplicator:
         if not zip_files:
             return
 
+        self.zip_files_seen += len(zip_files)
         logging.info(f"Found {len(zip_files)} ZIP files to analyze in {directory_path}")
 
         # Group files by base name pattern
@@ -658,15 +557,19 @@ class ZipDeduplicator:
             file_groups[base_name].append(file_path)
 
         # Process each group with multiple files using thread pool
-        with concurrent.futures.ThreadPoolExecutor(
-                max_workers=self.args.threads
-        ) as executor:
+        executor = concurrent.futures.ThreadPoolExecutor(max_workers=self.args.threads)
+        finished = False
+        try:
             future_to_group = {}
 
             for base_name, group in file_groups.items():
                 if len(group) > 1:
                     future = executor.submit(self.process_file_group, group)
                     future_to_group[future] = base_name
+
+            # The report compares every file, including ones with no sibling
+            if self.args.report:
+                list(executor.map(self.signature_for, zip_files))
 
             # Process completed groups and handle duplicates
             for future in concurrent.futures.as_completed(future_to_group):
@@ -685,100 +588,79 @@ class ZipDeduplicator:
 
                 except Exception as e:
                     logging.error(f"Error processing group '{base_name}': {e}")
+                    self.errors += 1
+            finished = True
+        finally:
+            # On an interrupt or error, drop queued work instead of waiting for it
+            executor.shutdown(wait=finished, cancel_futures=not finished)
 
-    def verify_identical_files(self, file1: str, file2: str) -> bool:
-        """Debug utility to verify and report when files are identical.
+    def write_report(self, report_path: str) -> int:
+        """Write the report of identical content this run did not remove.
 
-        Checks multiple comparison methods and only reports when files
-        are confirmed identical by any method.
+        Lists every set of two or more remaining files with identical content.
+        After the removal pass, such files differ in name or directory. The
+        file is overwritten. Nothing listed is deleted.
 
         Args:
-            file1: First file path
-            file2: Second file path
+            report_path: Where to write the tab-separated report
 
         Returns:
-            bool: True if files are identical by any method, False otherwise
+            int: Number of sets written
         """
-        # Track which methods confirm identity
-        identical_methods = []
+        by_signature: DefaultDict[Signature, List[str]] = defaultdict(list)
+        for path, signature in self._signatures.items():
+            if signature is not None and path not in self._removed:
+                by_signature[signature].append(path)
 
-        # Check file size
-        same_size = os.path.getsize(file1) == os.path.getsize(file2)
-        if not same_size:
-            return False  # If sizes differ, they can't be identical
-        identical_methods.append("file size")
+        sets = []
+        for paths in by_signature.values():
+            if len(paths) > 1:
+                sizes = {path: os.path.getsize(path) for path in paths}
+                # Space that would be freed by keeping only the largest copy
+                reclaimable = sum(sizes.values()) - max(sizes.values())
+                sets.append((reclaimable, sorted(paths), sizes))
+        sets.sort(key=lambda item: (-item[0], item[1]))
 
-        # Check CRC
-        try:
-            crc_match = self.compare_zips_by_crc(file1, file2)
-            if crc_match:
-                identical_methods.append("CRC values")
-        except Exception:
-            crc_match = False
+        os.makedirs(os.path.dirname(os.path.abspath(report_path)), exist_ok=True)
+        with open(report_path, "w", encoding="utf-8", newline="") as handle:
+            handle.write("set\tfiles_in_set\tsize_bytes\tpath\n")
+            for number, (_, paths, sizes) in enumerate(sets, 1):
+                for path in paths:
+                    handle.write(f"{number}\t{len(paths)}\t{sizes[path]}\t{path}\n")
+        return len(sets)
 
-        # Check content hash
-        try:
-            content_match = self.fallback_compare_zips_by_hash(file1, file2)
-            if content_match:
-                identical_methods.append("content hashes")
-        except Exception:
-            content_match = False
-
-        # Check whole file hash
-        try:
-            with open(file1, 'rb') as f1, open(file2, 'rb') as f2:
-                h1 = hashlib.sha256(f1.read()).hexdigest()
-                h2 = hashlib.sha256(f2.read()).hexdigest()
-                whole_file_match = h1 == h2
-                if whole_file_match:
-                    identical_methods.append("whole file SHA256")
-        except Exception:
-            whole_file_match = False
-
-        # Only report if at least one verification method confirms identity
-        # beyond just file size
-        if len(identical_methods) > 1:
-            print(f"\n🔍 IDENTICAL FILES DETECTED:")
-            print(f"File 1: {file1} ({self.format_size(os.path.getsize(file1))})")
-            print(f"File 2: {file2} ({self.format_size(os.path.getsize(file2))})")
-            print(f"Verified identical by: {', '.join(identical_methods)}")
-
-            # Additional details if files matched by whole file hash but not by CRC/content
-            if whole_file_match and not (crc_match or content_match):
-                print("⚠️ Note: Files have identical content but different internal ZIP structure")
-
-                # If we have whole file hashes, show them
-                if 'h1' in locals() and 'h2' in locals():
-                    print(f"  SHA256: {h1}")
-            return True
-        return False
+    def _action_label(self) -> str:
+        """Describe what this run does with a duplicate, for the statistics."""
+        if self.args.dry_run:
+            return "would be removed"
+        if self.args.backup_dir:
+            return "moved to backup"
+        return "deleted"
 
     def print_statistics(self) -> None:
         """Print detailed statistics about the deduplication process."""
+        action = self._action_label()
+        saved = "Space that would be saved" if self.args.dry_run else "Space saved"
+
         if self.stats["total_deleted"] == 0:
-            print("\nNo files were deleted during this run.")
+            print(f"\nNo files {action} during this run.")
             return
 
-        print("\nDeduplication Statistics:")
-        print(f"  Total files deleted: {self.stats['total_deleted']}")
-        print(
-            f"  Total space saved: {self.format_size(self.stats['total_bytes_saved'])}"
-        )
+        print("\nBreakdown by directory:")
+        for directory, dir_stats in sorted(self.stats["directories_processed"].items()):
+            if dir_stats["files"] > 0:
+                print(f"  {directory}:")
+                print(f"    Files {action}: {dir_stats['files']}")
+                print(f"    {saved}: {self.format_size(dir_stats['bytes'])}")
 
-        if self.stats["directories_processed"]:
-            print("\nBreakdown by directory:")
-            for directory, dir_stats in sorted(
-                self.stats["directories_processed"].items()
-            ):
-                if dir_stats["files"] > 0:
-                    print(f"  {directory}:")
-                    print(f"    Files deleted: {dir_stats['files']}")
-                    print(f"    Space saved: {self.format_size(dir_stats['bytes'])}")
+        print("\nDeduplication Statistics:")
+        print(f"  Total files {action}: {self.stats['total_deleted']}")
+        print(f"  {saved}: {self.format_size(self.stats['total_bytes_saved'])}")
 
     def print_startup_info(self) -> None:
         """Display startup information about the program configuration."""
         total_cores = multiprocessing.cpu_count()
-        print(f"ZIP File Deduplication Tool")
+        print("ZIP File Deduplication Tool")
         print(f"Using {self.args.threads} threads out of {total_cores} available cores")
         print(f"Scanning directory: {self.args.directory}")
         print(f"Strategy: {self.args.strategy}")
@@ -787,43 +669,69 @@ class ZipDeduplicator:
         if self.args.backup_dir:
             print(f"Backup mode: Files will be moved to {self.args.backup_dir}")
 
-    def run(self) -> None:
-        """Run the deduplication process."""
+    def run(self, argv: Optional[Sequence[str]] = None) -> int:
+        """Run the deduplication process.
+
+        Args:
+            argv: Command line arguments; defaults to the process arguments
+
+        Returns:
+            int: Exit code: 0 on success, 1 if anything could not be processed,
+                130 if interrupted
+        """
         # Parse arguments
-        self.args = self.parse_arguments()
+        self.args = self.parse_arguments(argv)
 
         # Set up logging
         self.setup_logging()
-
-        # Set up signal handler for clean interruption
-        signal.signal(signal.SIGINT, self.signal_handler)
 
         # Display startup information
         self.print_startup_info()
 
         # Create backup directory if specified
-        if self.args.backup_dir:
+        if self.args.backup_dir and not self.args.dry_run:
             os.makedirs(self.args.backup_dir, exist_ok=True)
 
         # Process the directory
         start_time = time.time()
+        outcome = "completed"
 
         try:
             self.process_directory(self.args.directory)
+        except KeyboardInterrupt:
+            logging.warning("Interrupted by user. No further files will be removed.")
+            outcome = "interrupted"
         except Exception as e:
             logging.error(f"Error: {e}")
-        finally:
-            # Always print statistics
-            elapsed_time = time.time() - start_time
-            print(f"\nProcessing completed in {elapsed_time:.2f} seconds")
-            self.print_statistics()
+            self.errors += 1
+
+        elapsed_time = time.time() - start_time
+        print(f"\nProcessing {outcome} in {elapsed_time:.2f} seconds")
+        self.print_statistics()
+
+        if outcome == "interrupted":
+            return 130
+
+        if self.args.report:
+            try:
+                count = self.write_report(self.args.report)
+                print(f"\nReport: {count} sets of identical content not removed by this run "
+                      f"written to {self.args.report}")
+            except OSError as e:
+                logging.error(f"Could not write report {self.args.report}: {e}")
+                self.errors += 1
+
+        if self.errors:
+            print(f"\n{self.errors} error(s) occurred; see the log above.")
+            return 1
+        return 0
 
 
-def main() -> None:
+def main(argv: Optional[Sequence[str]] = None) -> int:
     """Main program entry point."""
     deduplicator = ZipDeduplicator()
-    deduplicator.run()
+    return deduplicator.run(argv)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
